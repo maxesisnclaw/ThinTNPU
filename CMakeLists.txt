@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.16)
+project(thin_backend_kernels)
+if(NOT DEFINED ASCEND_CANN_PACKAGE_PATH)
+    set(ASCEND_CANN_PACKAGE_PATH "/usr/local/Ascend/ascend-toolkit/latest")
+endif()
+if(NOT DEFINED SOC_VERSION)
+    set(SOC_VERSION "ascend310p1")
+endif()
+include(${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
+ascendc_fatbin_library(add_kernels add.cpp)
+ascendc_fatbin_library(sigmoid_kernels sigmoid.cpp)
+ascendc_fatbin_library(maxpool_kernels maxpool.cpp)
+ascendc_fatbin_library(upsample_kernels upsample.cpp)
+
+ascendc_fatbin_library(elementwise_kernels elementwise.cpp)
+
+ascendc_fatbin_library(softmax_kernels softmax.cpp)
+ascendc_fatbin_library(nms_kernels nms_kernels.cpp)

@@ -1,0 +1,125 @@
+{
+  "source_revision": "a6dfc20",
+  "scope": "Earlier controlled five-round series on the same model/toolchain. These are historical host overhead figures, not measurements of the current planner. Parent-only PSS excludes native children; first-forward timing starts after model preparation.",
+  "summary": {
+    "thin": {
+      "steady_parent_pss_MiB": 317.1904296875,
+      "startup_sampled_parent_peak_pss_MiB": 424.833984375,
+      "first_forward_after_preparation_ms": 259.61700989864767,
+      "capture_setup_ms": 95.76866985298693
+    },
+    "native": {
+      "steady_parent_pss_MiB": 1665.3916015625,
+      "startup_sampled_parent_peak_pss_MiB": 1703.0283203125,
+      "first_forward_after_preparation_ms": 14630.264539970085,
+      "capture_setup_ms": 2301.5895599965006
+    }
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "thin": {
+        "steady_parent_pss_MiB": 310.1904296875,
+        "startup_sampled_parent_peak_pss_MiB": 424.833984375,
+        "first_forward_after_preparation_ms": 252.91161006316543,
+        "capture_setup_ms": 94.5019400678575,
+        "observed_direct_child_count": 0,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      },
+      "native": {
+        "steady_parent_pss_MiB": 1665.3916015625,
+        "startup_sampled_parent_peak_pss_MiB": 1703.0283203125,
+        "first_forward_after_preparation_ms": 14505.15331979841,
+        "capture_setup_ms": 2298.1617900077254,
+        "observed_direct_child_count": 3,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      }
+    },
+    {
+      "round": 2,
+      "thin": {
+        "steady_parent_pss_MiB": 317.0029296875,
+        "startup_sampled_parent_peak_pss_MiB": 424.583984375,
+        "first_forward_after_preparation_ms": 261.03395014069974,
+        "capture_setup_ms": 94.73015018738806,
+        "observed_direct_child_count": 0,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      },
+      "native": {
+        "steady_parent_pss_MiB": 1665.4541015625,
+        "startup_sampled_parent_peak_pss_MiB": 1703.1533203125,
+        "first_forward_after_preparation_ms": 15151.107949903235,
+        "capture_setup_ms": 2341.6464200709015,
+        "observed_direct_child_count": 3,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      }
+    },
+    {
+      "round": 3,
+      "thin": {
+        "steady_parent_pss_MiB": 317.3154296875,
+        "startup_sampled_parent_peak_pss_MiB": 424.896484375,
+        "first_forward_after_preparation_ms": 256.46689999848604,
+        "capture_setup_ms": 95.76866985298693,
+        "observed_direct_child_count": 0,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      },
+      "native": {
+        "steady_parent_pss_MiB": 1662.0478515625,
+        "startup_sampled_parent_peak_pss_MiB": 1702.482421875,
+        "first_forward_after_preparation_ms": 14618.857460096478,
+        "capture_setup_ms": 2299.4564899709076,
+        "observed_direct_child_count": 3,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      }
+    },
+    {
+      "round": 4,
+      "thin": {
+        "steady_parent_pss_MiB": 317.1904296875,
+        "startup_sampled_parent_peak_pss_MiB": 424.771484375,
+        "first_forward_after_preparation_ms": 267.2552999574691,
+        "capture_setup_ms": 102.887739893049,
+        "observed_direct_child_count": 0,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      },
+      "native": {
+        "steady_parent_pss_MiB": 1664.6728515625,
+        "startup_sampled_parent_peak_pss_MiB": 1702.3095703125,
+        "first_forward_after_preparation_ms": 14630.264539970085,
+        "capture_setup_ms": 2301.5895599965006,
+        "observed_direct_child_count": 3,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      }
+    },
+    {
+      "round": 5,
+      "thin": {
+        "steady_parent_pss_MiB": 324.6904296875,
+        "startup_sampled_parent_peak_pss_MiB": 425.271484375,
+        "first_forward_after_preparation_ms": 259.61700989864767,
+        "capture_setup_ms": 97.49522991478443,
+        "observed_direct_child_count": 0,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      },
+      "native": {
+        "steady_parent_pss_MiB": 1665.6103515625,
+        "startup_sampled_parent_peak_pss_MiB": 1703.3095703125,
+        "first_forward_after_preparation_ms": 15095.062509877607,
+        "capture_setup_ms": 2465.4325100127608,
+        "observed_direct_child_count": 3,
+        "capture_matches_self_eager_bitwise": true,
+        "changed_input_checks_match_self_eager_bitwise": true
+      }
+    }
+  ]
+}

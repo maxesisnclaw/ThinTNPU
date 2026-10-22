@@ -1,0 +1,91 @@
+{
+  "target": "310P3 synchronized captured operator wall time; 3 samples, 30 replays per sample",
+  "training_cases": [
+    [
+      32,
+      320,
+      64,
+      3,
+      2
+    ],
+    [
+      32,
+      160,
+      32,
+      3,
+      1
+    ],
+    [
+      64,
+      80,
+      64,
+      3,
+      1
+    ],
+    [
+      128,
+      80,
+      128,
+      3,
+      1
+    ],
+    [
+      128,
+      80,
+      256,
+      3,
+      2
+    ],
+    [
+      128,
+      40,
+      128,
+      3,
+      1
+    ],
+    [
+      256,
+      40,
+      256,
+      3,
+      1
+    ],
+    [
+      256,
+      40,
+      512,
+      3,
+      2
+    ],
+    [
+      512,
+      20,
+      128,
+      3,
+      1
+    ],
+    [
+      64,
+      20,
+      64,
+      3,
+      1
+    ]
+  ],
+  "candidate_count": 429,
+  "selection": "non-negative least squares, additive instruction/data-movement work proxy; fixed intercept excluded from candidate ranking",
+  "fit_rmse_us": 12.771794999788016,
+  "coefficients": {
+    "reductionStepUs": 0.124,
+    "cubeMillionMacUs": 0.185,
+    "imageLoad100kUs": 0.7718,
+    "weightLoad100kUs": 2.1483,
+    "epilogue10kUs": 3.161,
+    "imageDma100kUs": 1.5406,
+    "weightDma100kUs": 4.8369
+  },
+  "units": "Loads and DMA use half-element counts, Cube uses multiply-accumulate counts, epilogue uses output element counts. Feature counts are on the busiest spatial/channel core group. This is a ranking proxy, not an assertion of physical pipeline latency.",
+  "bitwise": "All retained candidates compared raw FP16 bits to the 32/16 default on the same random input and weights before timing; mismatches were not timed. The successful sweep logged no mismatches.",
+  "environment": "Ascend 310P3, CANN 9.0.0 in one calibration container environment; defaults are not hardware-independent constants. Recalibrate after hardware, driver or runtime environment changes.",
+  "use": "Documentation of fitted default ranking weights only; runtime planning enumerates legal capacity-constrained candidates and does not read measurement data or select from a shape lookup table."
+}
