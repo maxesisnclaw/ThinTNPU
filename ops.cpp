@@ -10,6 +10,7 @@
 #include <acl/acl_rt.h>
 #include <functional>
 #include <cstring>
+#include <numeric>
 #include "graph_capture.h"
 #include "kernel_operator.h"
 
@@ -23,6 +24,7 @@ at::Tensor& copy(at::Tensor&, const at::Tensor&, bool);
 }
 namespace thin_ops {
 constexpr auto npu = c10::DeviceType::PrivateUse1;
+namespace materialize { bool copy(at::Tensor&, const at::Tensor&); }
 void checked(aclError e) { thin::check(e, "thin_ops ACL runtime"); }
 void inference(const at::Tensor& x) {
   TORCH_CHECK(x.device().type() == npu && !x.requires_grad(), "thin ops require inference-only NPU tensors");
@@ -36,6 +38,7 @@ at::Tensor& copy_strided(at::Tensor& dst, const at::Tensor& src, bool nonblockin
   at::assert_no_partial_overlap(dst, src);
   thin::select(c10::Device(npu, 0));
   TORCH_CHECK(!thin::capturing() || dn, "Device-to-host copy is not allowed during graph capture");
+  if (dn && sn && !src.is_contiguous() && materialize::copy(dst, src)) return dst;
   thin::sync();
   auto kind = dn ? (sn ? ACL_MEMCPY_DEVICE_TO_DEVICE : ACL_MEMCPY_HOST_TO_DEVICE) : ACL_MEMCPY_DEVICE_TO_HOST;
   const auto bytes = dst.element_size();
@@ -84,6 +87,55 @@ using namespace AscendC;
 constexpr uint32_t tile = 1024;
 constexpr uint32_t source_capacity = tile * 16;
 
+__global__ __aicore__ void transpose_kernel(GM_ADDR src, GM_ADDR dst,
+                                            uint64_t outer, uint64_t rows, uint64_t columns) {
+  constexpr uint32_t span = 128;
+  TPipe pipe;
+  TBuf<QuePosition::VECCALC> input, output;
+  pipe.InitBuffer(input, span * 16 * sizeof(half));
+  pipe.InitBuffer(output, span * 16 * sizeof(half));
+  auto in = input.Get<half>(), out = output.Get<half>();
+  GlobalTensor<half> x, y;
+  x.SetGlobalBuffer((__gm__ half*)src);
+  y.SetGlobalBuffer((__gm__ half*)dst);
+  uint64_t tiles = (rows + span - 1) / span;
+  for (uint64_t task = GetBlockIdx(); task < outer * (columns / 16) * tiles;
+       task += GetBlockNum()) {
+    uint64_t pos = task % tiles * span;
+    uint64_t channel = task / tiles % (columns / 16) * 16;
+    uint64_t batch = task / tiles / (columns / 16);
+    uint32_t count = rows - pos < span ? rows - pos : span;
+    uint64_t source = batch * rows * columns + channel * rows + pos;
+    if ((rows - count) / 16 <= 65535)
+      DataCopy(in, x[source], DataCopyParams{16, (uint16_t)(count / 16),
+                                           (uint16_t)((rows - count) / 16), 0});
+    else
+      for (uint32_t c = 0; c < 16; ++c) DataCopy(in[c * count], x[source + c * rows], count);
+    SetFlag<HardEvent::MTE2_V>(0);
+    WaitFlag<HardEvent::MTE2_V>(0);
+    uint64_t sources[16], destinations[16];
+    for (uint32_t i = 0; i < 16; ++i) {
+      sources[i] = (uint64_t)in[i * count].GetPhyAddr();
+      destinations[i] = (uint64_t)out[i * 16].GetPhyAddr();
+    }
+    TransDataTo5HDParams params;
+    params.repeatTimes = count / 16;
+    params.srcRepStride = count == 16 ? 0 : 1;
+    params.dstRepStride = count == 16 ? 0 : 16;
+    TransDataTo5HD<half>(destinations, sources, params);
+    SetFlag<HardEvent::V_MTE3>(0);
+    WaitFlag<HardEvent::V_MTE3>(0);
+    uint64_t destination = batch * rows * columns + pos * columns + channel;
+    if ((columns - 16) / 16 <= 65535)
+      DataCopy(y[destination], out, DataCopyParams{(uint16_t)count, 1, 0,
+                                                (uint16_t)((columns - 16) / 16)});
+    else
+      for (uint32_t r = 0; r < count; ++r) DataCopy(y[destination + r * columns], out[r * 16], 16);
+    SetFlag<HardEvent::MTE3_MTE2>(0);
+    WaitFlag<HardEvent::MTE3_MTE2>(0);
+  }
+}
+
 __aicore__ inline uint64_t source_offset(uint64_t linear, LocalTensor<uint64_t> meta,
                                         uint32_t rank, uint64_t skew) {
   uint64_t offset = skew;
@@ -97,7 +149,7 @@ __aicore__ inline uint64_t source_offset(uint64_t linear, LocalTensor<uint64_t> 
 
 template<class T>
 __global__ __aicore__ void gather_kernel(GM_ADDR src, GM_ADDR dst, GM_ADDR metadata,
-                                        uint64_t length, uint32_t rank, uint64_t skew) {
+                                        uint64_t length, uint32_t rank, uint64_t skew, uint32_t step) {
   constexpr uint32_t align = 32 / sizeof(T);
   TPipe pipe;
   TBuf<QuePosition::VECCALC> input, output, offsets, shape;
@@ -117,15 +169,24 @@ __global__ __aicore__ void gather_kernel(GM_ADDR src, GM_ADDR dst, GM_ADDR metad
   DataCopy(meta, mg, (rank * 2 + 3) / 4 * 4);
   SetFlag<HardEvent::MTE2_S>(0);
   WaitFlag<HardEvent::MTE2_S>(0);
-  for (uint64_t start = GetBlockIdx() * tile; start < length;
-       start += GetBlockNum() * tile) {
-    uint32_t count = length - start < tile ? length - start : tile;
+  for (uint64_t start = GetBlockIdx() * step; start < length;
+       start += GetBlockNum() * step) {
+    uint32_t count = length - start < step ? length - start : step;
     uint32_t padded = (count + align - 1) / align * align;
     uint64_t inner = meta.GetValue((rank - 1) * 2);
     uint64_t stride = meta.GetValue((rank - 1) * 2 + 1);
     bool affine = padded == count && start % inner + count <= inner;
+    uint64_t a = inner, b = 8;
+    while (b) { uint64_t remainder = a % b; a = b; b = remainder; }
+    uint64_t period = inner / a * 8;
+    bool repeated = !affine && padded == count && period <= count && count % inner == 0 &&
+                    start % inner == 0 && rank >= 2 &&
+                    (start / inner) % meta.GetValue((rank - 2) * 2) + count / inner <=
+                        meta.GetValue((rank - 2) * 2);
+    uint64_t row_stride = repeated ? meta.GetValue((rank - 2) * 2 + 1) : 0;
     uint64_t low = source_offset(start, meta, rank, skew), high = low;
     if (affine) high += (count - 1) * stride;
+    else if (repeated) high += (count / inner - 1) * row_stride + (inner - 1) * stride;
     else {
       for (uint32_t j = 1; j < count; ++j) {
         uint64_t offset = source_offset(start + j, meta, rank, skew);
@@ -136,15 +197,16 @@ __global__ __aicore__ void gather_kernel(GM_ADDR src, GM_ADDR dst, GM_ADDR metad
     uint64_t base = low / align * align;
     uint64_t copied = (high - base + align) / align * align;
     if (copied <= source_capacity) {
-      if (affine) {
-        for (uint32_t j = 0; j < 8; ++j)
-          idx.SetValue(j, (low - base + j * stride) * sizeof(T));
+      if (affine || repeated) {
+        uint32_t seed = repeated ? period : 8;
+        for (uint32_t j = 0; j < seed; ++j)
+          idx.SetValue(j, (low - base + (repeated ? j / inner * row_stride + j % inner * stride : j * stride)) * sizeof(T));
         SetFlag<HardEvent::S_V>(0);
         WaitFlag<HardEvent::S_V>(0);
         auto signed_idx = offsets.Get<int32_t>();
-        for (uint32_t built = 8; built < padded;) {
+        for (uint32_t built = seed; built < padded;) {
           uint32_t n = padded - built < built ? padded - built : built;
-          Adds(signed_idx[built], signed_idx, int32_t(built * stride * sizeof(T)), n);
+          Adds(signed_idx[built], signed_idx, int32_t((repeated ? built / inner * row_stride : built * stride) * sizeof(T)), n);
           PipeBarrier<PIPE_V>();
           built += n;
         }
@@ -180,8 +242,9 @@ __global__ __aicore__ void gather_kernel(GM_ADDR src, GM_ADDR dst, GM_ADDR metad
   }
 }
 
-at::Tensor pack(const at::Tensor& x) {
-  if (!x.numel() || (x.is_contiguous() && reinterpret_cast<uintptr_t>(x.const_data_ptr()) % 32 == 0)) return x;
+bool copy(at::Tensor& out, const at::Tensor& x) {
+  if (!out.is_contiguous() || reinterpret_cast<uintptr_t>(out.const_data_ptr()) % 32 ||
+      (x.scalar_type() != at::kHalf && x.scalar_type() != at::kFloat)) return false;
   std::vector<uint64_t> dimensions;
   for (int64_t d = 0; d < x.dim(); ++d) {
     if (x.size(d) == 1) continue;
@@ -194,19 +257,40 @@ at::Tensor pack(const at::Tensor& x) {
     }
   }
   if (dimensions.empty()) dimensions = {1, 0};
+  auto address = reinterpret_cast<uintptr_t>(x.const_data_ptr());
+  size_t n = dimensions.size();
+  if (x.scalar_type() == at::kHalf && address % 32 == 0 && (n == 4 || n == 6) &&
+      dimensions[n - 3] == 1 && dimensions[n - 1] == dimensions[n - 4] &&
+      dimensions[n - 4] % 16 == 0 && dimensions[n - 2] % 16 == 0 &&
+      (n == 4 || dimensions[1] == dimensions[2] * dimensions[4])) {
+    uint64_t rows = dimensions[n - 4], columns = dimensions[n - 2];
+    uint64_t outer = x.numel() / rows / columns;
+    uint64_t tasks = outer * (columns / 16) * ((rows + 127) / 128);
+    transpose_kernel<<<std::min<uint64_t>(8, tasks), nullptr, thin::stream()>>>(
+        (GM_ADDR)x.const_data_ptr(), (GM_ADDR)out.data_ptr(), outer, rows, columns);
+    thin::sync();
+    return true;
+  }
   auto cpu_meta = at::empty({int64_t(dimensions.size())}, at::TensorOptions().dtype(at::kLong));
   std::memcpy(cpu_meta.data_ptr(), dimensions.data(), dimensions.size() * sizeof(uint64_t));
   auto meta = cpu_meta.to(x.device());
-  auto out = at::empty(x.sizes(), x.options());
-  auto address = reinterpret_cast<uintptr_t>(x.const_data_ptr());
   auto base = reinterpret_cast<GM_ADDR>(address / 32 * 32);
   uint64_t skew = address % 32 / x.element_size();
-  auto blocks = std::min<int64_t>(8, (x.numel() + tile - 1) / tile);
+  uint64_t quantum = std::lcm<uint64_t>(dimensions[n - 2], 32 / x.element_size());
+  uint32_t step = quantum <= tile ? tile / quantum * quantum : tile;
+  auto blocks = std::min<int64_t>(8, (x.numel() + step - 1) / step);
   if (x.scalar_type() == at::kFloat)
-    gather_kernel<uint32_t><<<blocks, nullptr, thin::stream()>>>(base, (GM_ADDR)out.data_ptr(), (GM_ADDR)meta.data_ptr(), x.numel(), dimensions.size() / 2, skew);
+    gather_kernel<uint32_t><<<blocks, nullptr, thin::stream()>>>(base, (GM_ADDR)out.data_ptr(), (GM_ADDR)meta.data_ptr(), x.numel(), dimensions.size() / 2, skew, step);
   else
-    gather_kernel<uint16_t><<<blocks, nullptr, thin::stream()>>>(base, (GM_ADDR)out.data_ptr(), (GM_ADDR)meta.data_ptr(), x.numel(), dimensions.size() / 2, skew);
+    gather_kernel<uint16_t><<<blocks, nullptr, thin::stream()>>>(base, (GM_ADDR)out.data_ptr(), (GM_ADDR)meta.data_ptr(), x.numel(), dimensions.size() / 2, skew, step);
   thin::sync();
+  return true;
+}
+
+at::Tensor pack(const at::Tensor& x) {
+  if (!x.numel() || (x.is_contiguous() && reinterpret_cast<uintptr_t>(x.const_data_ptr()) % 32 == 0)) return x;
+  auto out = at::empty(x.sizes(), x.options());
+  TORCH_CHECK(copy(out, x), "materialization supports float16/float32");
   return out;
 }
 }
@@ -331,6 +415,7 @@ void copy(const std::vector<at::Tensor>& tensors, at::Tensor& out, int64_t dim, 
   thin::sync();
 }
 }
+#include "strided_concat.h"
 at::Tensor cat(const at::ITensorListRef& inputs, int64_t dim) {
   std::vector<at::Tensor> tensors;
   for (const at::Tensor& t : inputs) tensors.push_back(t);
@@ -358,6 +443,10 @@ at::Tensor cat(const at::ITensorListRef& inputs, int64_t dim) {
   for (int64_t d = dim + 1; d < out.dim(); ++d) inner *= out.size(d);
   if (concatenate::aligned(tensors, dim, inner)) {
     concatenate::copy(tensors, out, dim, inner);
+    return out;
+  }
+  if (strided_concat::supported(tensors, out, dim, inner)) {
+    strided_concat::launch(tensors, out, dim, inner);
     return out;
   }
   int64_t start = 0;

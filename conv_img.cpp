@@ -371,8 +371,8 @@ at::Tensor prepare(const at::Tensor &w) {
                     !w.requires_grad(),
                 "expected allocation-base fp16 OIHW inference weights on NPU");
     int ci = w.size(1), co = w.size(0), k = w.size(2);
-    TORCH_CHECK(ci > 0 && co > 0 && (k == 1 || k == 3) && w.size(3) == k,
-                "expected 1x1 or 3x3 positive OIHW shape");
+    TORCH_CHECK(ci > 0 && co > 0 && (k == 1 || k == 3 || k == 6) && w.size(3) == k,
+                "expected supported square positive OIHW shape");
     thin::select(w.device());
     auto idx = indices(k, 16, w.options());
     auto packed = at::empty({(ci + 15) / 16, k * k, (co + 63) / 64 * 64, 16}, w.options());

@@ -32,11 +32,12 @@ __aicore__ inline void stage_native(LocalTensor<half> image, GlobalTensor<half> 
 
 __aicore__ inline void stage_tile(LocalTensor<half> image, GlobalTensor<half> input,
                                   int tile, int bank, int ci, int h, int width,
-                                  int stride, int oh, int ow, int maxP, int TM) {
+                                  int stride, int oh, int ow, int maxP, int TM, int kernel) {
     int pos = tile * TM, count = imin(TM, oh * ow - pos);
     int row = pos / ow, lastRow = (pos + count - 1) / ow;
-    int begin = (row * stride - 1 > 0 ? row * stride - 1 : 0) / stride * stride;
-    int end = imin(h, (lastRow * stride + 2 + stride - 1) / stride * stride);
+    int pad = (kernel - 1) / 2;
+    int begin = (row * stride - pad > 0 ? row * stride - pad : 0) / stride * stride;
+    int end = imin(h, (lastRow * stride + kernel - pad + stride - 1) / stride * stride);
     stage_native(image, input, 0, bank, ci, maxP, h * width, begin * width,
                  (end - begin) * width, (end - begin) * width, ci);
 }
@@ -125,8 +126,9 @@ __global__ __aicore__ void convolution_native(GM_ADDR x, GM_ADDR pw, GM_ADDR bp,
                                        int TM, int imageChannels, int imageBanks, int channelCores, int weightGroups, int dstPlane, int TN, int TK) {
     constexpr int banks = 2;
     int EM = imin(TM, (262144 - weightGroups * TN * 22) / (16 * TN) / 16 * 16);
+    bool residentPoint = KERNEL == 1 && TN * ci * 2 <= 65536;
     bool cachePoint = KERNEL == 1 && ci * h * width * 2 + TN * ci * 2 <= 1048576;
-    bool tileBuffered = KERNEL == 3 && imageChannels == ci && imageBanks == 2;
+    bool tileBuffered = KERNEL != 1 && imageChannels == ci && imageBanks == 2;
     TPipe pipe;
     TBuf<TPosition::A1> imageBuf;
     TBuf<TPosition::B1> weightBuf;
@@ -138,7 +140,7 @@ __global__ __aicore__ void convolution_native(GM_ADDR x, GM_ADDR pw, GM_ADDR bp,
                                          : imageBanks * imageChannels * maxP * 2);
     pipe.InitBuffer(weightBuf, weightGroups * TN * ci * KERNEL * KERNEL * 2);
     pipe.InitBuffer(aBuf, banks * TM * TK * 2);
-    pipe.InitBuffer(bBuf, KERNEL == 1 ? TN * ci * 2 : banks * TN * TK * 2);
+    pipe.InitBuffer(bBuf, residentPoint ? TN * ci * 2 : banks * TN * TK * 2);
     pipe.InitBuffer(cBuf, 2 * TN * TM * 4);
     pipe.InitBuffer(valueBuf, 2 * TN * EM * 4);
     pipe.InitBuffer(scratchBuf, TN * EM * 4);
@@ -171,7 +173,7 @@ __global__ __aicore__ void convolution_native(GM_ADDR x, GM_ADDR pw, GM_ADDR bp,
                 DataCopyParams{(uint16_t)(ci / 16 * kk), (uint16_t)TN, (uint16_t)((co + 63) / 64 * 64 - TN), 0});
             SetFlag<HardEvent::MTE2_MTE1>(2);
             WaitFlag<HardEvent::MTE2_MTE1>(2);
-            if constexpr (KERNEL == 1) {
+            if (residentPoint) {
                 LoadData2DParams ld;
                 ld.repeatTimes = ci / 16 * TN / 16;
                 ld.srcStride = 1;
@@ -201,7 +203,7 @@ __global__ __aicore__ void convolution_native(GM_ADDR x, GM_ADDR pw, GM_ADDR bp,
         int pendingPos = -1, pendingCount = 0, pendingBank = 0, pendingOc = 0, pendingGroup = 0;
         if (tileBuffered && GetBlockIdx() / channelCores < tiles)
             stage_tile(image, input, GetBlockIdx() / channelCores, 0,
-                           ci, h, width, stride, oh, ow, maxP, TM);
+                           ci, h, width, stride, oh, ow, maxP, TM, KERNEL);
         int spatialId = GetBlockIdx() / channelCores;
         int spatialWork = (tiles + spatialCores - 1 - spatialId) / spatialCores;
         for (int work = 0; work < spatialWork * weightGroups; ++work) {
@@ -223,11 +225,12 @@ __global__ __aicore__ void convolution_native(GM_ADDR x, GM_ADDR pw, GM_ADDR bp,
             int reductionSteps = ci * kk / TK, completedSteps = 0;
             int pos = tile * TM, count = (imin(TM, n - pos) + 15) / 16 * 16;
             int begin = 0, end = 1, length = TM;
-            if constexpr (KERNEL == 3) {
+            if constexpr (KERNEL != 1) {
                 int row = pos / ow, lastRow = (pos + count - 1) / ow;
                 int group = stride;
-                begin = (row * stride - 1 > 0 ? row * stride - 1 : 0) / group * group;
-                end = imin(h, (lastRow * stride + 2 + group - 1) / group * group);
+                int pad = (KERNEL - 1) / 2;
+                begin = (row * stride - pad > 0 ? row * stride - pad : 0) / group * group;
+                end = imin(h, (lastRow * stride + KERNEL - pad + group - 1) / group * group);
                 length = (end - begin) * width;
             }
             int sourcePos = KERNEL == 1 ? pos : begin * width;
@@ -245,7 +248,7 @@ __global__ __aicore__ void convolution_native(GM_ADDR x, GM_ADDR pw, GM_ADDR bp,
                 for (int k = 0; k < channels * kk; k += TK) {
                     int bank = (cb / imageChannels * (imageChannels * kk / TK) + k / TK) % banks;
                     auto a = aBuf.Get<half>()[bank * TM * TK];
-                    auto b = bBuf.Get<half>()[KERNEL == 1 ? (cb + k) * TN : bank * TN * TK];
+                    auto b = bBuf.Get<half>()[residentPoint ? (cb + k) * TN : bank * TN * TK];
                     WaitFlag<HardEvent::M_MTE1>(bank);
                     LoadData3DParamsV2<half> p;
                     p.l1H = KERNEL == 1 ? 1 : end - begin;
@@ -260,11 +263,11 @@ __global__ __aicore__ void convolution_native(GM_ADDR x, GM_ADDR pw, GM_ADDR bp,
                     p.filterH = KERNEL;
                     p.strideW = stride;
                     p.strideH = stride;
-                    if constexpr (KERNEL == 3)
+                    if constexpr (KERNEL != 1)
                         for (int i = 0; i < 4; ++i)
-                            p.padList[i] = 1;
+                            p.padList[i] = (KERNEL - 1) / 2;
                     LoadData(a, image[cachePoint ? cb * n : imageBank * imageChannels * maxP], p);
-                    if constexpr (KERNEL != 1) {
+                    if (!residentPoint) {
                         LoadData2DParams ld;
                         ld.repeatTimes = TK / 16 * TN / 16;
                         ld.srcStride = 1;
@@ -303,7 +306,7 @@ __global__ __aicore__ void convolution_native(GM_ADDR x, GM_ADDR pw, GM_ADDR bp,
                     }
                     if (tileBuffered && ng == 0 && k == 0 && tile + spatialCores < tiles)
                         stage_tile(image, input, tile + spatialCores, imageBank ^ 1,
-                                   ci, h, width, stride, oh, ow, maxP, TM);
+                                   ci, h, width, stride, oh, ow, maxP, TM, KERNEL);
                     if (!cachePoint && imageBanks == 2 && k == 0 && cb + imageChannels < ci) {
                         SetFlag<HardEvent::MTE1_MTE2>(2);
                         WaitFlag<HardEvent::MTE1_MTE2>(2);
@@ -400,6 +403,60 @@ __global__ __aicore__ void trim_output(GM_ADDR src, GM_ADDR dst, int channels, i
 }
 
 
+__global__ __aicore__ void pack_input_channels(GM_ADDR src, GM_ADDR dst, int ci, int n) {
+    constexpr int tile = 256;
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> rawBuf, outBuf;
+    pipe.InitBuffer(rawBuf, 16 * tile * 2);
+    pipe.InitBuffer(outBuf, 16 * tile * 2);
+    auto raw = rawBuf.Get<half>(), out = outBuf.Get<half>();
+    GlobalTensor<half> input, output;
+    input.SetGlobalBuffer((__gm__ half*)src);
+    output.SetGlobalBuffer((__gm__ half*)dst);
+    int tiles = (n + tile - 1) / tile;
+    for (int work = GetBlockIdx(); work < ((ci + 15) / 16) * tiles; work += GetBlockNum()) {
+        int cb = work / tiles * 16, base = work % tiles * tile;
+        int channels = imin(16, ci - cb), count = imin(tile, n - base);
+        Duplicate(raw, (half)0, tile * 16);
+        SetFlag<HardEvent::V_MTE2>(0);
+        WaitFlag<HardEvent::V_MTE2>(0);
+        for (int c = 0; c < channels; ++c)
+            DataCopy(raw[c * tile], input[(cb + c) * n + base], count);
+        SetFlag<HardEvent::MTE2_V>(0);
+        WaitFlag<HardEvent::MTE2_V>(0);
+        uint64_t sources[16], destinations[16];
+        for (int i = 0; i < 16; ++i) {
+            sources[i] = (uint64_t)raw[i * tile].GetPhyAddr();
+            destinations[i] = (uint64_t)out[i * 16].GetPhyAddr();
+        }
+        TransDataTo5HDParams params;
+        params.repeatTimes = count / 16;
+        params.srcRepStride = count == 16 ? 0 : 1;
+        params.dstRepStride = count == 16 ? 0 : 16;
+        TransDataTo5HD<half>(destinations, sources, params);
+        SetFlag<HardEvent::V_MTE3>(0);
+        WaitFlag<HardEvent::V_MTE3>(0);
+        DataCopy(output[cb * n + base * 16], out, count * 16);
+        SetFlag<HardEvent::MTE3_V>(0);
+        WaitFlag<HardEvent::MTE3_V>(0);
+    }
+}
+
+at::Tensor pack_input(const at::Tensor &x) {
+    TORCH_CHECK(x.device().type() == c10::DeviceType::PrivateUse1 && x.dim() == 4 &&
+                x.size(0) == 1 && x.size(1) > 0 &&
+                x.size(2) > 0 && x.size(3) > 0 && x.size(2) * x.size(3) % 16 == 0 &&
+                ((x.size(1) + 15) / 16 * 16) * x.size(2) * x.size(3) <= std::numeric_limits<int>::max() &&
+                x.scalar_type() == at::kHalf && x.is_contiguous() && x.storage_offset() == 0 &&
+                !x.requires_grad(), "expected contiguous FP16 NCHW input with /16 spatial plane");
+    thin::select(x.device());
+    auto y = at::empty({1, (x.size(1) + 15) / 16, x.size(2), x.size(3), 16}, x.options());
+    pack_input_channels<<<8, nullptr, thin::stream()>>>((GM_ADDR)x.data_ptr(), (GM_ADDR)y.data_ptr(),
+                                                     x.size(1), x.size(2) * x.size(3));
+    thin::sync();
+    return y;
+}
+
 struct ConvPlan {
     int m, n = 32, k = 16, channelCores = 1, inputChannels, inputBanks, maxP, epilogueM, weightGroups = 1;
     int64_t ubBytes, l1Bytes;
@@ -407,14 +464,15 @@ struct ConvPlan {
 
 bool fill_plan(ConvPlan &plan, int ci, int co, int h, int w, int kernel, int stride) {
     constexpr int64_t l1Capacity = 1048576, ubCapacity = 262144;
-    int oh = (h - 1) / stride + 1, ow = (w - 1) / stride + 1;
+    int oh = (h + 2 * ((kernel - 1) / 2) - kernel) / stride + 1;
+    int ow = (w + 2 * ((kernel - 1) / 2) - kernel) / stride + 1;
     int groups = (co + plan.n - 1) / plan.n;
     int64_t fullInput = int64_t(ci) * h * w * 2;
-    int rows = (plan.m + ow - 2) / ow + 1;
-    plan.maxP = kernel == 1 ? plan.m : std::min(h, (rows - 1) * stride + 3 + 2 * (stride - 1)) * w;
+    int rows = (ow - std::gcd(plan.m, ow) + plan.m - 1) / ow + 1;
+    plan.maxP = kernel == 1 ? plan.m : std::min(h, (rows - 1) * stride + kernel + 2 * (stride - 1)) * w;
     int64_t weights = int64_t(plan.n) * ci * kernel * kernel * 2;
     int assignedGroups = (groups + plan.channelCores - 1) / plan.channelCores;
-    if (kernel == 3 && plan.channelCores == 1 && fullInput > l1Capacity &&
+    if (kernel != 1 && plan.channelCores == 1 && fullInput > l1Capacity &&
         assignedGroups * weights + int64_t(ci) * plan.maxP * 2 <= l1Capacity)
         plan.weightGroups = assignedGroups;
     weights *= plan.weightGroups;
@@ -440,7 +498,8 @@ bool fill_plan(ConvPlan &plan, int ci, int co, int h, int w, int kernel, int str
 }
 
 double plan_cost(const ConvPlan &p, int ci, int co, int h, int w, int kernel, int stride) {
-    int spatial = ((h - 1) / stride + 1) * ((w - 1) / stride + 1);
+    int spatial = ((h + 2 * ((kernel - 1) / 2) - kernel) / stride + 1) *
+                  ((w + 2 * ((kernel - 1) / 2) - kernel) / stride + 1);
     int groups = (co + p.n - 1) / p.n, spatialCores = 8 / p.channelCores;
     int tiles = (spatial + p.m - 1) / p.m;
     double rounds = (tiles + spatialCores - 1) / spatialCores;
@@ -464,31 +523,24 @@ double plan_cost(const ConvPlan &p, int ci, int co, int h, int w, int kernel, in
 ConvPlan make_plan(int ci, int co, int h, int w, int kernel, int stride) {
     TORCH_CHECK(ci > 0 && ci % 16 == 0 && co > 0 && h > 0 && w > 0,
                 "expected positive shape and C0-aligned input channels");
-    TORCH_CHECK((kernel == 1 && stride == 1) || (kernel == 3 && (stride == 1 || stride == 2)),
+    TORCH_CHECK((kernel == 1 && stride == 1) || ((kernel == 3 || kernel == 6) && (stride == 1 || stride == 2)),
                 "expected point stride1 or spatial stride1/2");
-    if (kernel == 1) {
-        ConvPlan p;
-        TORCH_CHECK(int64_t(ci) * p.n * 2 <= 65536, "pointwise resident weights exceed L0B");
-        int groups = (co + p.n - 1) / p.n;
-        while (p.channelCores * 2 <= groups && p.channelCores * 2 <= 8) p.channelCores *= 2;
-        int perCore = (h * w + 8 / p.channelCores - 1) / (8 / p.channelCores);
-        p.m = std::min(1024, (perCore + 15) / 16 * 16);
-        TORCH_CHECK(fill_plan(p, ci, co, h, w, kernel, stride), "pointwise strip exceeds hardware buffers");
-        return p;
-    }
+    TORCH_CHECK(h + 2 * ((kernel - 1) / 2) >= kernel && w + 2 * ((kernel - 1) / 2) >= kernel,
+                "kernel exceeds padded input");
     ConvPlan best;
     double bestCost = std::numeric_limits<double>::infinity();
-    for (int tn : {32, 64, 128}) {
+    for (int tn = 16; tn <= 128; tn += 16) {
         // Bias is padded to 32, not to TN; wider tiles need complete output groups.
         if (tn != 32 && co % tn) continue;
         int groups = (co + tn - 1) / tn, channelCores = 1;
         while (channelCores * 2 <= groups && channelCores * 2 <= 8) channelCores *= 2;
         if (groups <= 2 && int64_t(ci) * h * w * 2 > 1048576) channelCores = 1;
-        for (int tk = 16; tk <= 65536 / (4 * tn) && tk <= ci * 9; tk += 16) {
+        for (int tk = 16; tk <= 65536 / (4 * tn) && tk <= ci * kernel * kernel; tk += 16) {
             // LoadData consumes full TK steps; the L1 chunk quantum preserves this divisibility.
-            if (ci * 9 % tk) continue;
+            if (ci * kernel * kernel % tk) continue;
             int maxM = std::min(65536 / (4 * tk), 262144 / (8 * tn)) / 16 * 16;
-            int spatial = ((h - 1) / stride + 1) * ((w - 1) / stride + 1);
+            int spatial = ((h + 2 * ((kernel - 1) / 2) - kernel) / stride + 1) *
+                  ((w + 2 * ((kernel - 1) / 2) - kernel) / stride + 1);
             for (int m = 16; m <= maxM && m <= (spatial + 15) / 16 * 16; m += 16) {
                 ConvPlan p;
                 p.m = m; p.n = tn; p.k = tk; p.channelCores = channelCores;
@@ -519,11 +571,12 @@ at::Tensor conv(const at::Tensor &x, const at::Tensor &packed, const std::option
                 "blocked convolution shape exceeds LoadData/index range: ", x.sizes());
     int ci = x.size(1) * 16, h = x.size(2), w = x.size(3);
     bool point = kernel == 1;
-    TORCH_CHECK((point && stride == 1) || (kernel == 3 && (stride == 1 || stride == 2)),
+    TORCH_CHECK((point && stride == 1) || ((kernel == 3 || kernel == 6) && (stride == 1 || stride == 2)),
                 "expected point stride1 or spatial stride1/2");
     TORCH_CHECK(co > 0 && co <= 65536 && (nchw || co % 16 == 0),
                 "blocked outputs require aligned channels and packed-weight DMA strides must fit uint16");
-    int64_t outputPixels = int64_t((h - 1) / stride + 1) * ((w - 1) / stride + 1);
+    int64_t outputPixels = int64_t((h + 2 * ((kernel - 1) / 2) - kernel) / stride + 1) *
+                           ((w + 2 * ((kernel - 1) / 2) - kernel) / stride + 1);
     TORCH_CHECK(co * ((outputPixels + 15) / 16 * 16) <= std::numeric_limits<int>::max(),
                 "blocked convolution output exceeds index range");
     TORCH_CHECK(packed.device() == x.device() && packed.scalar_type() == at::kHalf &&
@@ -537,7 +590,8 @@ at::Tensor conv(const at::Tensor &x, const at::Tensor &packed, const std::option
                     "expected same-device padded FP16 bias");
     auto plan = make_plan(ci, co, h, w, kernel, stride);
     thin::select(x.device());
-    int oh = (h - 1) / stride + 1, ow = (w - 1) / stride + 1;
+    int oh = (h + 2 * ((kernel - 1) / 2) - kernel) / stride + 1;
+    int ow = (w + 2 * ((kernel - 1) / 2) - kernel) / stride + 1;
     int n = oh * ow, np = (n + 15) / 16 * 16;
     auto y =
         nchw ? at::empty({1, co, oh, ow}, x.options()) : at::empty({1, co / 16, oh, ow, 16}, x.options());
@@ -557,8 +611,10 @@ at::Tensor conv(const at::Tensor &x, const at::Tensor &packed, const std::option
     }
     if (point) {
         OUTPUT(1);
-    } else {
+    } else if (kernel == 3) {
         OUTPUT(3);
+    } else {
+        OUTPUT(6);
     }
 #undef OUTPUT
 #undef RUN
@@ -576,12 +632,15 @@ TORCH_LIBRARY_FRAGMENT(thin_native_flow, m) {
     m.def("conv(Tensor x, Tensor packed, Tensor? bias, int co, int kernel, int stride, bool fused=True, bool "
           "nchw_output=False) -> Tensor");
     m.def("stem(Tensor x, Tensor w, Tensor? bias) -> Tensor");
+    m.def("pack_input(Tensor x) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(thin_native_flow, PrivateUse1, m) {
     m.impl("conv", TORCH_FN(native_flow::conv));
     m.impl("stem", TORCH_FN(image_c4::conv_blocked));
+    m.impl("pack_input", TORCH_FN(native_flow::pack_input));
 }
 TORCH_LIBRARY_IMPL(thin_native_flow, AutogradPrivateUse1, m) {
     m.impl("conv", torch::CppFunction::makeFallthrough());
     m.impl("stem", torch::CppFunction::makeFallthrough());
+    m.impl("pack_input", torch::CppFunction::makeFallthrough());
 }

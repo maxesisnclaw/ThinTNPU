@@ -2,3 +2,6 @@ ThinTNPU
 Copyright 2026 maxesisnclaw
 
 Licensed under the Apache License, Version 2.0.
+
+Third-party model definitions, runtime dependencies and separately supplied
+weights retain their own licenses. See DEPENDENCIES.md.
