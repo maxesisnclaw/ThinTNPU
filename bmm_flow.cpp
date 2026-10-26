@@ -35,6 +35,15 @@ __global__ __aicore__ void multiply(GM_ADDR ap, GM_ADDR bp, GM_ADDR yp,
                                     int batches, int m, int k, int n, int np, int width, bool sliced_right, Matrix ad, Matrix bd) {
     TPipe pipe;
     TBuf<TPosition::VECCALC> leftBuf, rightBuf, halfBuf, rowBuf, accumBuf, indexBuf, baseBuf;
+    TBuf<TPosition::VECCALC> leftIndexBuf, leftBaseBuf, leftHalfBuf, leftFloatBuf, broadcastBuf;
+    pipe.InitBuffer(leftIndexBuf, ROWS * 4);
+    pipe.InitBuffer(leftBaseBuf, ROWS * 4);
+    pipe.InitBuffer(leftHalfBuf, ROWS * 2);
+    pipe.InitBuffer(leftFloatBuf, ROWS * 4);
+    pipe.InitBuffer(broadcastBuf, ROWS * 8 * 4);
+    auto leftIndices = leftIndexBuf.Get<int32_t>(), leftBases = leftBaseBuf.Get<int32_t>();
+    auto leftHalves = leftHalfBuf.Get<half>();
+    auto leftFloats = leftFloatBuf.Get<float>(), broadcast = broadcastBuf.Get<float>();
     pipe.InitBuffer(leftBuf, LEFT_CAPACITY * 2);
     pipe.InitBuffer(rightBuf, RIGHT_CAPACITY * 2);
     pipe.InitBuffer(halfBuf, TILE * 2);
@@ -79,6 +88,11 @@ __global__ __aicore__ void multiply(GM_ADDR ap, GM_ADDR bp, GM_ADDR yp,
             columns.SetValue(j, sliced_right ? (j < count ? j : count - 1) * 32
                                              : int32_t((offset(bb, 0, c) - offset(bb, 0, start)) * 2));
         }
+        if (cached_left) {
+            for (int rr = 0; rr < ROWS; ++rr)
+                leftBases.SetValue(rr, int32_t((offset(aa, r + (rr < rows ? rr : rows - 1), 0)
+                    + batch * ad.batch - abase) * 2));
+        }
         Duplicate(accum, 0.0f, ROWS * TILE);
         PipeBarrier<PIPE_ALL>();
         for (int reduction = 0; reduction < k; ++reduction) {
@@ -111,7 +125,21 @@ __global__ __aicore__ void multiply(GM_ADDR ap, GM_ADDR bp, GM_ADDR yp,
             PipeBarrier<PIPE_V>();
             Cast(row, halves, RoundMode::CAST_NONE, padded);
             PipeBarrier<PIPE_V>();
-            for (int rr = 0; rr < rows; ++rr) {
+            if (cached_left) {
+                int32_t shift = int32_t((offset(aa, r, reduction) - offset(aa, r, 0)) * 2);
+                Adds(leftIndices, leftBases, shift, ROWS);
+                PipeBarrier<PIPE_V>();
+                Gather(leftHalves, left, leftIndices.ReinterpretCast<uint32_t>(), 0, ROWS);
+                PipeBarrier<PIPE_V>();
+                Cast(leftFloats, leftHalves, RoundMode::CAST_NONE, ROWS);
+                PipeBarrier<PIPE_V>();
+                Brcb(broadcast, leftFloats, ROWS / 8, {1, 8});
+                PipeBarrier<PIPE_V>();
+                // Broadcast across columns, not reduction: each output retains its FP32 addition order.
+                for (int c = 0; c < padded; c += 64)
+                    MulAddDst(accum[c], row[c], broadcast, uint64_t(padded - c < 64 ? padded - c : 64),
+                              uint8_t(rows), {1, 1, 0, TILE / 8, 0, 1});
+            } else for (int rr = 0; rr < rows; ++rr) {
                 int64_t left_index = offset(aa, r + rr, reduction) + batch * ad.batch;
                 if (!cached_left) {
                     PipeBarrier<PIPE_ALL>();

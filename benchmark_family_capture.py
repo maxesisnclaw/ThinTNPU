@@ -12,7 +12,8 @@ import sys
 import time
 
 
-def measure(model, image, *, backend, output, warmup=30, samples=101, metadata=None):
+def measure(model, image, *, backend, output, warmup=30, samples=101, metadata=None,
+            attention_scale_before_matmul=False):
     """Measure one fused CPU nn.Module in a fresh Thin or native process."""
     import torch
 
@@ -37,7 +38,8 @@ def measure(model, image, *, backend, output, warmup=30, samples=101, metadata=N
     def leaves(value):
         if isinstance(value, torch.Tensor):
             return [value]
-        return [tensor for item in value for tensor in leaves(item)]
+        entries = value.values() if isinstance(value, dict) else value
+        return [tensor for item in entries for tensor in leaves(item)]
 
     def cpu(value):
         return [tensor.cpu().contiguous() for tensor in leaves(value)]
@@ -48,7 +50,7 @@ def measure(model, image, *, backend, output, warmup=30, samples=101, metadata=N
         rows = []
         for left, right in zip(actual, expected):
             assert left.shape == right.shape and left.dtype == right.dtype
-            same = torch.equal(left.view(torch.int16), right.view(torch.int16))
+            same = torch.equal(left.reshape(-1).view(torch.uint8), right.reshape(-1).view(torch.uint8))
             finite = bool(left.isfinite().all())
             rows.append(dict(shape=list(left.shape), bit_equal=same, finite=finite))
             assert same and finite, rows
@@ -78,7 +80,7 @@ def measure(model, image, *, backend, output, warmup=30, samples=101, metadata=N
                 from blocked_graph import FrozenGraph
                 load_native_flow()
                 prepare_model(model, fuse_silu=True)
-                blocked = WholeBlocked(model)
+                blocked = WholeBlocked(model, attention_scale_before_matmul=attention_scale_before_matmul)
                 blocked.enable()
             image_npu = image.to('npu')
             sync()
@@ -144,7 +146,7 @@ def measure(model, image, *, backend, output, warmup=30, samples=101, metadata=N
 
 def main():
     parser = argparse.ArgumentParser(description='One fresh-process YOLO family graph-replay measurement')
-    parser.add_argument('--family', choices=('v5m', 'v8s', 'v11s'), required=True)
+    parser.add_argument('--family', choices=('v5m', 'v8s', 'v11s', 'v26s'), required=True)
     parser.add_argument('--backend', choices=('thin', 'native'), required=True)
     parser.add_argument('--model', type=Path, required=True)
     parser.add_argument('--model-format', choices=('fused-module', 'ultralytics'), required=True)
@@ -166,13 +168,17 @@ def main():
     image = fixture['x'] if args.family == 'v8s' else fixture['cases']['640x640']['image_fp16']
     if args.model_format == 'ultralytics':
         from ultralytics import YOLO
-        model = YOLO(str(args.model)).model.fuse()
+        model = YOLO(str(args.model)).model.cpu().eval()
+        if args.family == 'v26s':
+            model.end2end = True
+        model.fuse()
     else:
         model = torch.load(args.model, map_location='cpu', weights_only=False)['model']
     if not isinstance(model, torch.nn.Module):
         raise TypeError('The supplied model must be an nn.Module')
     measure(model, image, backend=args.backend, output=args.output,
             warmup=args.warmup, samples=args.samples,
+            attention_scale_before_matmul=args.family == 'v26s',
             metadata=dict(family=args.family, model_format=args.model_format,
                           model_sha256=hashlib.sha256(args.model.read_bytes()).hexdigest(),
                           fixture_sha256=hashlib.sha256(args.fixture.read_bytes()).hexdigest()))

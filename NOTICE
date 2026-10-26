@@ -3,5 +3,7 @@ Copyright 2026 maxesisnclaw
 
 Licensed under the Apache License, Version 2.0.
 
-Third-party model definitions, runtime dependencies and separately supplied
-weights retain their own licenses. See DEPENDENCIES.md.
+Ultralytics v5/v8/v11/v26 model classes and forwards are separately obtained
+under their upstream AGPL-3.0 or commercial terms. ThinTNPU's license does not
+override those obligations. No upstream source tree or weights are bundled.
+Runtime dependencies and assets retain their own licenses. See DEPENDENCIES.md.

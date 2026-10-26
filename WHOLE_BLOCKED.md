@@ -1,6 +1,6 @@
 # Blocked YOLO inference
 
-The shared execution path keeps FP16 activations in NC1HWC0 between the stem and Detect terminals. It uses ThinTNPU's Ascend C kernels and ACL graph runtime, without loading `torch_npu`, aclnn or TBE in the Thin process. Classic YOLOv5, YOLOv8 and YOLO11 use explicit architecture adapters over these primitives.
+The shared execution path keeps FP16 activations in NC1HWC0 between the stem and Detect terminals. It uses ThinTNPU's Ascend C kernels and ACL graph runtime, without loading `torch_npu`, aclnn or TBE in the Thin process. Classic YOLOv5, YOLOv8, YOLO11 and YOLO26 use explicit architecture adapters over these primitives.
 
 ## Build
 
@@ -14,7 +14,7 @@ export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 ```
 
-The flow libraries are `thin_backend/libconv_flow.so`, `thin_backend/libflow_ops.so`, `thin_backend/libbmm_flow.so` and `thin_backend/libdepthwise_flow.so`. `load_native_flow()` loads all four for every family; the bmm/depthwise libraries must be built even for a model that does not use their operators. The region guard is built by `build_blocked_c2f.sh`.
+The flow libraries are `thin_backend/libconv_flow.so`, `thin_backend/libflow_ops.so`, `thin_backend/libbmm_flow.so` and `thin_backend/libdepthwise_flow.so`. `load_native_flow()` loads all four for every family; the bmm/depthwise libraries must be built even for a model that does not use their operators. `WholeBlocked` also loads `thin_backend/libselection_flow.so` for an end-to-end dictionary head. Build it with `build_selection_flow.sh` (included by `build_all.sh`). The region guard is built by `build_blocked_c2f.sh`.
 
 ## Layout and numerical contract
 
@@ -86,3 +86,9 @@ python3 verify_depthwise_flow.py
 ```
 
 [Classic v5](YOLO_ANCHOR_BASED.md) and [YOLO11](YOLO11.md) document the family-specific checks. Model/reference fixtures are supplied separately. Eager/capture and corresponding Thin-fixture bitwise comparisons do not assert CPU FP32 bit-exactness. The [benchmark index](benchmarks/README.md) separates unified-family capture/validation from historical v8 measurements.
+
+## Direct-distance end-to-end heads
+
+[YOLO26](YOLO26.md) adds the fused one-to-one dictionary head, direct-distance decoding without DFL and device-resident selection. Its FP32 `[1,300,6]` output at 640² includes every selected row. C3k/PSABlock and residual SPPF retain the supplied frontend's container forwards. Set `attention_scale_before_matmul=True` when the original frontend prescales Q; the default retains v11's post-matmul rounding order.
+
+Selection uses a deterministic lower-index tie order rather than unspecified `torch.topk` ties. Compare against stable same-input references separately from CPU whole-model errors. See [limitations](LIMITATIONS.md) for the full output/accuracy boundary.

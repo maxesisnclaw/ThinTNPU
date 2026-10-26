@@ -66,6 +66,27 @@ public:
         auto scalar = reduced.Get<float>();
         if constexpr (Last) {
             for (uint64_t row = GetBlockIdx(); row < outer; row += GetBlockNum()) {
+                if (reduction <= TILE) {
+                    uint32_t padded = (reduction + 15) / 16 * 16;
+                    auto a = load(row * pitch, padded);
+                    ReduceMax(scalar, a, tmp, reduction, false);
+                    PipeBarrier<PIPE_ALL>();
+                    float maximum = -__builtin_inff();
+                    float v = scalar.GetValue(0);
+                    maximum = maximum > v ? maximum : v;
+                    Adds(a, a, -maximum, padded);
+                    PipeBarrier<PIPE_V>();
+                    Exp(a, a, padded);
+                    PipeBarrier<PIPE_V>();
+                    ReduceSum(scalar, a, tmp, reduction);
+                    PipeBarrier<PIPE_ALL>();
+                    float denominator = 0.0f;
+                    denominator += scalar.GetValue(0);
+                    Muls(a, a, 1.0f / denominator, padded);
+                    PipeBarrier<PIPE_V>();
+                    store(row * pitch, a, padded);
+                    continue;
+                }
                 float maximum = -__builtin_inff();
                 for (uint64_t k = 0; k < reduction; k += TILE) {
                     uint32_t n = reduction - k < TILE ? reduction - k : TILE;

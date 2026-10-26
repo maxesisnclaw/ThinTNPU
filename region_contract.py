@@ -6,8 +6,9 @@ class RegionContract:
     attributes = ('in_channels', 'out_channels', 'kernel_size', 'stride', 'padding', 'padding_mode',
                   'dilation', 'groups', 'add', 'c', 'inplace', 'scale_factor', 'mode',
                   'align_corners', 'size', 'ceil_mode', 'return_indices',
-                  'num_heads', 'head_dim', 'key_dim', 'scale', 'shortcut',
-                  'nl', 'na', 'no', 'nc', 'export', 'reg_max', 'end2end', '_thin_strides')
+                  'num_heads', 'head_dim', 'key_dim', 'scale', 'shortcut', 'n', '_thin_attention_prescale',
+                  'nl', 'na', 'no', 'nc', 'export', 'reg_max', 'end2end', '_thin_strides',
+                  'max_det', 'agnostic_nms', 'xyxy')
 
     def __init__(self, roots, ignored_forward=()):
         modules = tuple(m for root in roots for m in root.modules())

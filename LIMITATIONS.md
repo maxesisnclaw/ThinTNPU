@@ -2,9 +2,9 @@
 
 ## Supported execution path
 
-`WholeBlocked` is an opt-in, inference-only integration for classic YOLOv5, YOLOv8 and YOLO11, not a complete PyTorch device backend. It accepts fused evaluation models with frozen FP16 parameters, batch 1 and three-level non-export Detect heads. Classic v5 uses anchors/objectness; v8/v11 use anchor-free DFL with 16 bins. Supported blocks include C3/C2f/C3k2/C3k, SPPF, nearest-neighbor upsample and C2PSA attention, subject to their channel/layout contracts.
+`WholeBlocked` is an opt-in, inference-only integration for classic YOLOv5, YOLOv8, YOLO11 and YOLO26, not a complete PyTorch device backend. It accepts fused evaluation models with frozen FP16 parameters, batch 1 and three-level non-export Detect heads. Classic v5 uses anchors/objectness; v8/v11 use anchor-free DFL with 16 bins. The supported YOLO26 dictionary head uses direct ltrb distances (`reg_max=1`), no DFL, and a fused one-to-one end-to-end branch. Supported blocks include C3/C2f/C3k2/C3k, ordinary/residual SPPF, nearest-neighbor upsample, C2PSA and nested PSABlock attention, subject to their channel/layout contracts.
 
-Dense undilated convolution and multiplier-one depthwise are distinct supported cases. The model adapter accepts depthwise only when `groups == in_channels == out_channels`, channels are C0-aligned, and the kernel is k3/s1/p1 with SiLU or Identity. **General grouped convolution and depthwise multiplier >1 are unsupported.** YOLO11n's eight-channel intermediate layouts are not supported. Training, gradients, arbitrary modules/batches, Focus/reorg stems, export/end-to-end/segmentation heads and arbitrary dilated convolution are outside scope.
+Dense undilated convolution and multiplier-one depthwise are distinct supported cases. The model adapter accepts depthwise only when `groups == in_channels == out_channels`, channels are C0-aligned, and the kernel is k3/s1/p1 with SiLU or Identity. **General grouped convolution and depthwise multiplier >1 are unsupported.** YOLO11n's eight-channel intermediate layouts are not supported. Training, gradients, arbitrary modules/batches, Focus/reorg stems, export/segmentation and other unsupported head contracts and arbitrary dilated convolution are outside scope.
 
 External inputs must be allocation-base, contiguous FP16 NCHW `[1,3,H,W]` tensors on the NPU. H and W must be positive multiples of 32. Internal features use NC1HWC0; Detect terminals restore NCHW. Each graph has one fixed shape/dtype/device/stride contract. Capture a separate graph for another shape; there is no H/W-only graph cache.
 
@@ -12,8 +12,8 @@ The shape-generalized contract belongs to `WholeBlocked`. The separate `BlockedC
 
 ## Freeze → capture → replay without mutation
 
-1. Load a trusted checkpoint, fuse batch normalization, select eval mode, disable gradients and move the model to FP16 NPU tensors under `torch.no_grad()`. Do **not** construct parameters under `inference_mode()`: frozen-state validation requires version counters.
-2. Run `prepare_model(model, fuse_silu=True)`, construct and enable `WholeBlocked`, then capture `FrozenGraph(blocked, blocked.run, example)`.
+1. Load a trusted checkpoint, select the intended branch before fusion (YOLO26: `model.end2end = True`), fuse batch normalization, select eval mode, disable gradients and move the model to FP16 NPU tensors under `torch.no_grad()`. Do **not** construct parameters under `inference_mode()`: frozen-state validation requires version counters.
+2. Run `prepare_model(model, fuse_silu=True)`, construct and enable `WholeBlocked` with the original frontend's attention scaling order (YOLO26: `attention_scale_before_matmul=True`), then capture `FrozenGraph(blocked, blocked.run, example)`.
 3. Keep the model, prepared weights, padded biases, wrapper and captured graph alive. Replay on the creating thread and stream, without concurrent execution or mutation. `graph(value)` validates input metadata, copies NPU input into the graph's static buffer and replays. `graph.replay()` reuses that static input.
 4. Returned outputs are borrowed graph-owned buffers and are overwritten by later replays. Copy/clone results before retaining them. Operations are asynchronous; synchronize when timing or consuming results outside the NPU stream. Moving to CPU provides the synchronization used in the example.
 5. Close the graph on its owner thread before destroying the model/wrapper. To change weights, model structure, operator configuration or Detect output mode, close the old graph, reconstruct/reprepare the model as needed, and capture again. A graph is not an automatically invalidated model cache.
@@ -47,9 +47,23 @@ Coordinates are normalized by `max(H, W, max(abs(CPU decoded coordinates)))`. Th
 
 ## Generalization within YOLO
 
-The shared implementation combines general layout/strided-bmm/depthwise primitives with explicit model-family adapters. Classic v5 decoding obtains anchors, class counts and strides from the supplied module; YOLO11 attention uses logical channel ranges over blocked QKV, not checkpoint or image-size dispatch. Public model definitions and weights remain separate inputs. No application-specific loader is provided.
+The shared implementation combines general layout/strided-bmm/depthwise primitives with explicit model-family adapters. Classic v5 decoding obtains anchors, class counts and strides from the supplied module; YOLO11/YOLO26 attention uses logical channel ranges over blocked QKV, not checkpoint or image-size dispatch. Public model definitions and weights remain separate inputs. No application-specific loader is provided.
 
-The unified five-round synchronized capture measurement gives Thin/native latency ratios of 0.977× for v8s, 1.271× for v5m and 1.195× for v11s. V8 is near native; v5/v11 remain around a 1.2–1.3× floor for the measured fixtures. These are latency ratios, not universal performance bounds or evidence that integration caused a speedup. The models have different class counts and separately supplied weights. See [family capture data](benchmarks/family_capture_640.json) for every round and sample. Historical v8 data remains separate. Family names alone do not guarantee every size/revision is supported; v26 and other families are unverified.
+The unified five-round synchronized capture measurements retain every round/sample in [family capture data](benchmarks/family_capture_640.json). Ratios are Thin/native latency, not speedup. Models have different class counts and weights; neither absolute cross-family comparisons nor a family name alone guarantees support for every size/revision. YOLO11n and general grouped convolution remain unsupported.
+
+Attention uses sequential-order FP32 accumulation in vector bmm plus vector softmax, not a native fused attention engine. These shared primitives remain a latency floor for v11/v26. The v5/v11/v26 cases remain above native latency in the measured comparison; classic v5 has no attention and has a distinct residual convolution/layout floor. No portable latency bound follows from these observations.
+
+## YOLO26 output and selection
+
+Select one-to-one **before** fusing. Setting a flag after fusion cannot restore the removed branch. Q prescaling versus post-matmul scaling is a numerical frontend contract, not algebraic freedom; half rounding changes if they are interchanged. The guard tracks the selected attention/Detect options but is still not a complete immutability proof.
+
+Direct ltrb distances decode as `(anchors - left_top, anchors + right_bottom) * strides`, without DFL, sigmoid or clipping on distances. Classification independently uses sigmoid. Supported NMS-free selection stays on-device: class maximum, anchor top-k, class-score gather, flattened candidate top-k, anchor mapping, box gather and output packing.
+
+The measured YOLO26s 640² end-to-end output is FP32 `[1,300,6]` (`xyxy, score, class`). More generally it is `[B,min(max_det,anchors),6]` for the selection primitive; primitive multi-batch support does not broaden the batch-one whole-model contract. No confidence threshold, IoU suppression, clipping or original-image coordinate restoration is included. Packing promotes labels and the final tensor to FP32; coordinates/scores were computed in FP16.
+
+Equal scores use deterministic **lower-index** ordering. This does not reproduce `torch.topk`'s unspecified tied-index order. Same-input selected tuples can therefore differ, especially with many tied low-confidence scores. Whole-model CPU-reference differences also include FP16 numerical changes before selection. Selection reference tests, unchanged prior-Thin tensor outputs and eager/capture equality do not imply equality to official final detections or validated mAP. Complete real-image outputs, including low-confidence rows, remain part of regression coverage; reference errors are preserved in [validation data](benchmarks/family_validation.json).
+
+Selection's K≤512 retained-prefix merge and larger-K complete merge-path sort use the same score/index total order. UB capacities are tiling choices, not model/image/class lookup tables. All 65,536 half encodings are exercised in selection tests; this is not a promise that every other operator preserves every NaN payload. See [selection](SELECTION_FLOW.md) and [coverage](SELECTION_GENERALIZATION.md).
 
 Hardware validation is limited to Ascend 310P3 (`dav-2002`). No compatibility or performance claim is made for other Ascend chips. No chip-level parity claim follows from a particular model's synchronized graph latency.
 

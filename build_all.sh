@@ -7,3 +7,4 @@ bash build_flow_conv.sh
 bash build_flow_ops.sh
 bash build_bmm_flow.sh
 bash build_depthwise_flow.sh
+bash build_selection_flow.sh

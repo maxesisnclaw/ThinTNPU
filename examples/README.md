@@ -52,3 +52,13 @@ All examples use FP16 N=1 on the NPU. Capture requires frozen versioned paramete
 For synchronized family timing, the [capture benchmark](../FAMILY_BENCHMARK.md) accepts external model/fixture CLI inputs or a caller-constructed fused `nn.Module`. Its Thin/native workers always run in separate processes.
 
 Thin eager/capture or corresponding Thin-fixture bitwise equality is not CPU FP32 bit-exactness. Neither these examples nor a shape printout establish accuracy or benchmark results. Upstream model classes and supplied weights retain their separate licenses; see [DEPENDENCIES.md](../DEPENDENCIES.md).
+## YOLO26s
+
+Use a compatible separately installed Ultralytics frontend and trusted local weights:
+
+```bash
+export YOLO_CONFIG_DIR="$PWD/.yolo-config"
+python3 examples/infer_v26.py --model /path/to/yolo26s.pt --height 640 --width 640
+```
+
+The example selects one-to-one before fusion, keeps Q-prescale attention order, and captures the full NMS-free output. At 640² it returns FP32 `[1,300,6]`, not only raw decoded heads. Stable lower-index ties, borrowed-output lifetime and external preprocessing/coordinate restoration are described in [limitations](../LIMITATIONS.md).

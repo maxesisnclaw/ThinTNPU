@@ -93,8 +93,13 @@ def attention_forward(module, x):
     tokens = height * width
     heads = batch * module.num_heads
     qkv = module.qkv(x).view(batch, -1, tokens, 16)
-    scores = ops.layout_bmm(qkv, qkv, True, False, False, heads,
-                            0, module.key_dim, module.key_dim, module.key_dim) * module.scale
+    if module._thin_attention_prescale:
+        query = ops.channel_select(qkv, heads, 0, module.key_dim) * module.scale
+        scores = ops.layout_bmm(query, qkv, True, False, False, heads,
+                                0, module.key_dim, module.key_dim, module.key_dim)
+    else:
+        scores = ops.layout_bmm(qkv, qkv, True, False, False, heads,
+                                0, module.key_dim, module.key_dim, module.key_dim) * module.scale
     probability = scores.softmax(dim=-1)
     mixed = ops.layout_bmm(qkv, probability, False, True, True, heads,
                            2 * module.key_dim, module.head_dim)
@@ -110,14 +115,57 @@ def c2psa_forward(module, x):
     return module.cv2(torch.cat((a, module.m(b)), dim=1))
 
 
+def anchorfree_predictions(module, features):
+    box_head, cls_head = ((module.one2one_cv2, module.one2one_cv3) if module.end2end
+                          else (module.cv2, module.cv3))
+    batch = features[0].size(0)
+    boxes = torch.cat([head(x).view(batch, 4 * module.reg_max, -1)
+                       for head, x in zip(box_head, features)], -1)
+    scores = torch.cat([head(x).view(batch, module.nc, -1)
+                        for head, x in zip(cls_head, features)], -1)
+    key = tuple((x.size(2), x.size(3)) for x in features)
+    if key not in module._thin_grid_cache:
+        points, strides = [], []
+        for (height, width), stride in zip(key, module._thin_strides):
+            y, x = torch.meshgrid(torch.arange(height, dtype=torch.float16) + 0.5,
+                                  torch.arange(width, dtype=torch.float16) + 0.5, indexing='ij')
+            points.append(torch.stack((x, y), 0).reshape(2, -1))
+            strides.append(torch.full((1, height * width), stride, dtype=torch.float16))
+        module._thin_grid_cache[key] = (torch.cat(points, -1).to(boxes.device),
+                                        torch.cat(strides, -1).to(boxes.device))
+    anchors, strides = module._thin_grid_cache[key]
+    distance = module.dfl(boxes)
+    left_top, right_bottom = distance.split((2, 2), dim=1)
+    lower, upper = anchors.unsqueeze(0) - left_top, anchors.unsqueeze(0) + right_bottom
+    if not module.end2end and not module.xyxy:
+        decoded_boxes = torch.cat(((lower + upper) / 2, upper - lower), 1) * strides
+    else:
+        decoded_boxes = torch.cat((lower, upper), 1) * strides
+    decoded = torch.cat((decoded_boxes, scores.sigmoid()), 1)
+    raw = {'boxes': boxes, 'scores': scores, 'feats': features}
+    return decoded, raw
+
+
+def anchorfree_detect_forward(module, features):
+    decoded, raw = anchorfree_predictions(module, features)
+    if module.end2end:
+        output = ops.detection_select(decoded.transpose(1, 2), module.max_det, module.agnostic_nms)
+        raw = {'one2many': {}, 'one2one': raw}
+    else:
+        output = decoded
+    return output, raw
+
+
 class WholeBlocked:
-    """Fused YOLO blocked flow with anchor-free DFL or classic anchor/objectness Detect.
+    """Fused YOLO blocked flow with direct-distance, DFL or anchor/objectness Detect.
 
     Intermediate channels use NC1HWC0; Detect terminals restore NCHW. Each captured
     graph fixes its input shape, while eager execution and fresh captures accept /32 H/W.
+    attention_scale_before_matmul selects the frontend's FP16 rounding order; it must
+    match the original Attention forward rather than an algebraic rearrangement.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, attention_scale_before_matmul=False):
         from ultralytics.nn.modules.block import Attention, C2PSA, DFL
         from ultralytics.nn.modules.head import Detect
 
@@ -143,8 +191,16 @@ class WholeBlocked:
             detect.register_buffer('_thin_pixel_anchors',
                                    (anchors * strides[:, None, None]).half().to(detect.anchors.device),
                                    persistent=False)
-        elif detect.reg_max != 16 or detect.end2end:
-            raise ValueError('Expected DFL(16) non-end2end Detect')
+        elif detect.reg_max not in (1, 16):
+            raise ValueError('Expected direct-distance or DFL(16) Detect')
+        dictionary_head = not anchor_based and hasattr(detect, 'forward_head')
+        if not anchor_based:
+            if detect.end2end and not dictionary_head:
+                raise ValueError('End-to-end Detect requires dictionary head semantics')
+            detect._thin_strides = tuple(detect.stride.detach().cpu().float().tolist())
+            detect._thin_grid_cache = {}
+            if detect.end2end:
+                torch.ops.load_library(str(Path(__file__).parent / 'thin_backend' / 'libselection_flow.so'))
 
         stem = root[0]
         if (not isinstance(stem.act, nn.SiLU) or stem.conv.in_channels != 3 or stem.conv.kernel_size not in ((3, 3), (6, 6))
@@ -156,7 +212,14 @@ class WholeBlocked:
 
         wrapped = set(m.conv for m in model.modules() if is_conv_wrapper(m))
         terminals = set()
-        tails = list(detect.m) if anchor_based else [branch[-1] for branch in (*detect.cv2, *detect.cv3)]
+        if anchor_based:
+            tails = list(detect.m)
+        else:
+            branches = ((detect.one2one_cv2, detect.one2one_cv3) if detect.end2end
+                        else (detect.cv2, detect.cv3))
+            if any(branch is None or len(branch) != detect.nl for branch in branches):
+                raise ValueError('Selected inference branch must contain all Detect levels')
+            tails = [branch[-1] for family in branches for branch in family]
         for tail in tails:
             if (type(tail) is not nn.Conv2d or tail.kernel_size != (1, 1)
                     or tail.stride != (1, 1) or tail.groups != 1 or tail.bias is None
@@ -224,6 +287,8 @@ class WholeBlocked:
 
         self.model = model
         self.detect = detect
+        for module in attentions:
+            module._thin_attention_prescale = attention_scale_before_matmul
         self.replacements = {
             stem: (stem.forward, MethodType(stem_forward, stem)),
             **{m: (m.forward, MethodType(conv_forward, m)) for m in convs},
@@ -233,6 +298,7 @@ class WholeBlocked:
             **{m: (m.forward, MethodType(maxpool_forward, m)) for m in maxpools},
             **{m: (m.forward, MethodType(upsample_forward, m)) for m in upsamples},
             **({detect: (detect.forward, MethodType(anchor_detect_forward, detect))} if anchor_based else {}),
+            **({detect: (detect.forward, MethodType(anchorfree_detect_forward, detect))} if dictionary_head else {}),
         }
         from region_contract import RegionContract
         self.contract = RegionContract((model,), ignored_forward=tuple(self.replacements))
